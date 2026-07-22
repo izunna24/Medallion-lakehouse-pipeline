@@ -74,3 +74,68 @@ Gold (status counts): 76 (shipped) + 59 (cancelled) + 76 (delivered) + 70 (place
 Gold aggregates sum back exactly to the Silver row count — confirming the
 pipeline is lossless: every row is either present in Silver, or explicitly
 quarantined with a reason, never silently dropped.
+
+PR #2:
+
+Medallion Architecture Pipeline with Data Quality Gatekeeper & SCD Type 2 History
+
+## Overview
+This PR implements an end-to-end Medallion Architecture data pipeline using
+PySpark (4.0.3) and Delta Lake (4.0.0). The pipeline ingests multi-day raw e-commerce
+orders, enforces schema integrity, isolates data anomalies using a
+**Gatekeeper Pattern**, Delta Lake History(Transaction Log), tracks order lifecycle status updates via
+**Slowly Changing Dimensions (SCD) Type 2**, and surfaces audit-ready
+historical logs in the Gold layer.
+
+## Technical Features & Architectural Highlights
+
+### 1. Bronze Layer: Ingestion Cleanup & Idempotency
+- **Runtime Path Cleansing**: Dynamically resets local testing paths
+ (`shutil.rmtree`) to prevent schema drift issues during local iterations.
+- **Lineage Metadata**: Enriches landing CSV records with operational
+columns (`ingest_date`, `source_filename`).
+- **Idempotency**: Utilizes Delta Merge operations based on composite keys
+ (`order_id` + `source_filename`) to guarantee safe re-runs without record duplication.
+
+### 2. Silver Layer: Data Quality Gatekeeper Pattern
+- **Type Safety**: Enforces schema constraints using `try_cast` for dates to trap
+malformed values as `NULL` without breaking batch processing.
+- **Independent Anomaly Detection**: Evaluates multi-flag validation rules
+ (`is_conflicting`, `is_invalid_quantity`, `is_invalid_date`).
+- **Quarantine Routing**: Automatically diverts invalid records into `data/quarantine/orders/`
+with concatenated, audit-friendly `quarantine_reason` tags (e.g., `invalid_quantity+invalid_date`).
+- **Pre-Deduplication Evaluation**: Data Quality flags are evaluated *prior* to
+deduplication to ensure raw anomaly counts are fully preserved and accounted for.
+
+### 3. SCD Type 2 Merge Strategy
+- **Two-Step State Updates**:
+  1. Expire existing records (`is_current = false`, set `valid_to = current_timestamp()`)
+  when a status update is detected.
+  2. Insert updated status records as active
+   (`is_current = true`, `valid_from = current_timestamp()`, `valid_to = NULL`).
+- Unchanged orders bypass updates, preserving state without generating redundant version rows.
+
+### 4. Gold Layer: History Audit Log
+- Extracts full lifecycle status transitions for orders experiencing changes
+into `data/gold/scd/orders`.
+- Confirms state consistency: each updated order reflects exactly two state records
+ (1 historical closed version + 1 active current version).
+
+## Example verified chain from a real run:
+ day1 raw data content : 312 rows
+ day2 raw data content : 38 rows
+ day2 manifest(used to verify successful merge) : 38 rows
+ Quarantined_path1 :  15 rows
+ Quarantined_path2 :  0 row (clean data)
+ rows with history : 20 history + 20 current = 40 rows
+ order_id mismatch_count != 2 on rows with history = 0 row
+ 
+
+## Environment & Requirements
+- **Frameworks**: `pyspark==4.0.3`, `delta-spark==4.0.0`
+- **Execution Environment**: Tested on Google Colab and local Spark runtime.
+- **Delta Package Dependency**: Auto-resolves `io.delta:delta-spark_2.13:4.0.0`.
+
+## Execution Command
+To run the full end-to-end pipeline locally:
+python medallion/pipeline/pr2_medallion.py
